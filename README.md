@@ -1,2 +1,10 @@
-ResNet50 Image Retrieval Benchmarking
-This project benchmarks image retrieval using a fine-tuned ResNet50 model on a custom dataset of 451,958 images across 100 classes. The pipeline covers stratified data splitting (70/15/15), transfer learning by unfreezing layer4 with dropout regularisation, embedding extraction from the penultimate 2048-dimensional layer, and retrieval evaluation using FAISS-accelerated cosine similarity. Results achieved: Precision@1: 91.20%, Precision@5: 90.89%, and kNN Accuracy @21: 91.75%.
+# OpenCLIP Image Retrieval Benchmarking
+
+This project benchmarks zero-shot image retrieval using OpenCLIP ViT-B-32 pretrained on LAION-2B (2 billion image-text pairs) on a custom dataset of 451,958 images across 100 classes. No fine-tuning is performed — embeddings are extracted directly from the pretrained model using 512-dimensional vectors and evaluated using FAISS-accelerated cosine similarity, demonstrating that CLIP achieves competitive performance against a fine-tuned ResNet50 with zero task-specific training.
+
+## Results
+| Metric | Score |
+|--------|-------|
+| Precision@1 | 89.38% |
+| Precision@5 | 88.48% |
+| kNN Accuracy @21 | 91.16% |
