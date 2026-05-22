@@ -1,62 +1,56 @@
-import open_clip
-import torch
+"""
+OpenCLIP ViT-H/14 Loader
+--------------------------
+Loads OpenCLIP ViT-H/14 pretrained on LAION-2B.
+Zero-shot model — no training required.
+Provides model and dataloaders ready for embedding extraction.
+
+Model      : ViT-H/14
+Pretrained : LAION-2B (2 billion image-text pairs)
+Embedding  : 1024 dimensions
+"""
+
 import os
-import warnings
-import numpy as np
-from tqdm import tqdm
-import faiss
-
-
-from PIL import ImageFile
-from torch.utils.data.dataloader import default_collate
+import torch
+import open_clip
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.dataloader import default_collate
 from sklearn.model_selection import train_test_split
+from PIL import ImageFile
 
-warnings.filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Load OpenCLIP 
-model, _, preprocess_val = open_clip.create_model_and_transforms(
-    'ViT-B-32',
-    pretrained='laion2b_s34b_b79k'
-)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model  = model.to(device)
-model.eval()
-print(f"Using device : {device}")
-
-# ── Config ─────────────────────────────────────────────
-DATA_DIR       = '//media/isesat/e8188905-1ffc-4de1-83b6-ac2addc2a941'   # path to your dataset folder
+# CONFIG 
+DATA_DIR       = '/media/isesat/e8188905-1ffc-4de1-83b6-ac2addc2a941'
+MODEL_NAME     = 'ViT-H-14'
+PRETRAINED     = 'laion2b_s32b_b79k'
+EMBEDDING_DIM  = 1024
+BATCH_SIZE     = 8     # smaller batch due to large model size (632M params)
 IMAGE_EXTS     = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".heic"}
 IGNORE_FOLDERS = {'.Trash-1001', 'lost+found'}
-RUN_EXTRACTION = False
-NUM_CLASSES=100
 
-# ── Load Dataset ───────────────────────────────────────
+# Download model to local drive instead of home directory
+os.environ['HF_HOME'] = '/media/isesat/e8188905-1ffc-4de1-83b6-ac2addc2a941/hf_cache'
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# DATASET 
 class FilteredImageFolder(ImageFolder):
+    # Excludes system folders from dataset
     def find_classes(self, directory):
         classes = [
-            folder for folder in os.listdir(directory)
-            if os.path.isdir(os.path.join(directory, folder))
-            and folder not in IGNORE_FOLDERS
+            f for f in os.listdir(directory)
+            if os.path.isdir(os.path.join(directory, f))
+            and f not in IGNORE_FOLDERS
         ]
         classes.sort()
-        class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
-        return classes, class_to_idx
-
-dataset = FilteredImageFolder(
-    root=DATA_DIR,
-    transform=preprocess_val,  # ← using CLIP's own preprocessing
-    is_valid_file=lambda path: os.path.splitext(path)[1].lower() in IMAGE_EXTS
-)
-
-print(f"Classes found : {len(dataset.classes)}")
-print(f"Total images  : {len(dataset)}")
+        return classes, {cls: idx for idx, cls in enumerate(classes)}
 
 
 class SafeDataset(torch.utils.data.Dataset):
+    # Skips corrupted images gracefully
     def __init__(self, subset):
         self.subset = subset
 
@@ -68,152 +62,59 @@ class SafeDataset(torch.utils.data.Dataset):
             return self.subset[idx]
         except Exception:
             return None
-        
+
+
 def collate_skip_none(batch):
+    # Removes None entries caused by corrupted images
     batch = [x for x in batch if x is not None]
     if len(batch) == 0:
         return None
     return default_collate(batch)
-# Stratified split
-indices = list(range(len(dataset)))
-labels  = [dataset.targets[i] for i in indices]
 
-train_val_idx, test_idx = train_test_split(
-    indices, test_size=0.15, stratify=labels, random_state=42
-)
 
-train_val_labels = [labels[i] for i in train_val_idx]
-train_idx, val_idx = train_test_split(
-    train_val_idx, test_size=0.17647, stratify=train_val_labels, random_state=42
-)
-
-train_dataset = Subset(dataset, train_idx)
-test_dataset  = Subset(dataset, test_idx)
-
-train_loader = DataLoader(SafeDataset(train_dataset), batch_size=128,
-                          shuffle=False, num_workers=20, pin_memory=True,
-                          collate_fn=collate_skip_none, prefetch_factor=2)
-test_loader  = DataLoader(SafeDataset(test_dataset),  batch_size=128,
-                          shuffle=False, num_workers=20, pin_memory=True,
-                          collate_fn=collate_skip_none, prefetch_factor=2)
-
-print(f"Train : {len(train_dataset)} | Test : {len(test_dataset)}")
-
-def extract_clip_embeddings(loader, model, device):
-    all_embeddings = []
-    all_labels     = []
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Extracting embeddings"):
-            if batch is None:
-                continue
-            images, labels = batch
-            images = images.to(device)
-
-            # CLIP has a built in method for image embeddings
-            embeddings = model.encode_image(images)
-
-            all_embeddings.append(embeddings.cpu().numpy())
-            all_labels.append(labels.numpy())
-
-    return (
-        np.concatenate(all_embeddings, axis=0),
-        np.concatenate(all_labels,     axis=0)
+# DATALOADERS 
+def get_dataloaders(preprocess):
+    # Uses CLIP's own preprocessing — handles resizing and normalisation
+    dataset = FilteredImageFolder(
+        root=DATA_DIR,
+        transform=preprocess,
+        is_valid_file=lambda p: os.path.splitext(p)[1].lower() in IMAGE_EXTS
     )
 
-if RUN_EXTRACTION:
-    print("Extracting train embeddings ...")
-    train_embeddings, train_labels = extract_clip_embeddings(train_loader, model, device)
+    # Stratified split: 70% train / 15% val / 15% test
+    indices = list(range(len(dataset)))
+    labels  = [dataset.targets[i] for i in indices]
 
-    print("Extracting test embeddings ...")
-    test_embeddings, test_labels = extract_clip_embeddings(test_loader, model, device)
+    train_val_idx, test_idx = train_test_split(
+        indices, test_size=0.15, stratify=labels, random_state=42
+    )
+    train_val_labels = [labels[i] for i in train_val_idx]
+    train_idx, val_idx = train_test_split(
+        train_val_idx, test_size=0.17647,
+        stratify=train_val_labels, random_state=42
+    )
 
-    print(f"Train embeddings : {train_embeddings.shape}")
-    print(f"Test embeddings  : {test_embeddings.shape}")
+    print(f"Train : {len(train_idx)} | Val : {len(val_idx)} | Test : {len(test_idx)}")
 
-    np.savez('clip_embeddings.npz',
-             train_embeddings = train_embeddings,
-             train_labels     = train_labels,
-             test_embeddings  = test_embeddings,
-             test_labels      = test_labels)
-    print("Embeddings saved → clip_embeddings.npz")
+    loader_args = dict(batch_size=BATCH_SIZE, shuffle=False,
+                       collate_fn=collate_skip_none,
+                       num_workers=4, pin_memory=True)
 
-else:
-    data             = np.load('clip_embeddings.npz')
-    train_embeddings = data['train_embeddings']
-    train_labels     = data['train_labels']
-    test_embeddings  = data['test_embeddings']
-    test_labels      = data['test_labels']
-    print("Embeddings loaded from clip_embeddings.npz")
+    train_loader = DataLoader(SafeDataset(Subset(dataset, train_idx)), **loader_args)
+    val_loader   = DataLoader(SafeDataset(Subset(dataset, val_idx)),   **loader_args)
+    test_loader  = DataLoader(SafeDataset(Subset(dataset, test_idx)),  **loader_args)
 
-def build_faiss_index(embeddings):
-    """Build a FAISS index from train embeddings."""
-    embeddings = embeddings.astype('float32')
-    
-    # Normalise embeddings for cosine similarity
-    faiss.normalize_L2(embeddings)
-    
-    # Build index
-    index = faiss.IndexFlatIP(embeddings.shape[1])  # Inner product = cosine similarity after normalisation
-    index.add(embeddings)
-    
-    print(f"FAISS index built with {index.ntotal} vectors")
-    return index
+    return train_loader, val_loader, test_loader
 
 
-def evaluate_retrieval(test_embeddings, test_labels, index, train_labels, k=5):
-    query = test_embeddings.astype('float32')
-    faiss.normalize_L2(query)
+# LOAD MODEL 
+# create_model_and_transforms returns model, train_preprocess, val_preprocess
+# val_preprocess used for consistent embedding extraction (no augmentation)
+model, _, preprocess = open_clip.create_model_and_transforms(
+    MODEL_NAME, pretrained=PRETRAINED
+)
+model = model.to(device).eval()
+print(f"OpenCLIP {MODEL_NAME} loaded (pretrained: {PRETRAINED})")
 
-    p_at_1 = []
-    p_at_k = []
-    
-    chunk_size = 1000  # search 1000 queries at a time
-
-    for start in tqdm(range(0, len(query), chunk_size), desc="Precision Evaluation"):
-        end        = min(start + chunk_size, len(query))
-        chunk      = query[start:end]
-        
-        _, indices = index.search(chunk, k)
-        
-        for i, idx in enumerate(indices):
-            query_label  = test_labels[start + i]
-            top_k_labels = train_labels[idx]
-            correct      = (top_k_labels == query_label)
-
-            p_at_1.append(float(correct[0]))
-            p_at_k.append(correct.sum() / k)
-
-    print(f"Precision@1  : {np.mean(p_at_1):.4f}")
-    print(f"Precision@{k} : {np.mean(p_at_k):.4f}")
-
-
-def knn_evaluation(test_embeddings, test_labels, index, train_labels, k=21):
-    query = test_embeddings.astype('float32')
-    faiss.normalize_L2(query)
-
-    correct    = 0
-    chunk_size = 1000
-
-    for start in tqdm(range(0, len(query), chunk_size), desc="kNN Evaluation"):
-        end        = min(start + chunk_size, len(query))
-        chunk      = query[start:end]
-
-        _, indices = index.search(chunk, k)
-
-        for i, idx in enumerate(indices):
-            query_label     = test_labels[start + i]
-            top_k_labels    = train_labels[idx]
-            votes           = np.bincount(top_k_labels, minlength=NUM_CLASSES)
-            predicted_class = np.argmax(votes)
-
-            if predicted_class == query_label:
-                correct += 1
-
-    accuracy = correct / len(test_embeddings)
-    print(f"kNN Accuracy (k={k}) : {accuracy:.4f}")
-
-print("\n── Retrieval Evaluation ──")
-index = build_faiss_index(train_embeddings)
-#evaluate_retrieval(test_embeddings, test_labels, index, train_labels, k=5)
-knn_evaluation(test_embeddings, test_labels, index, train_labels, k=21)
+# LOAD DATALOADERS 
+train_loader, val_loader, test_loader = get_dataloaders(preprocess)
